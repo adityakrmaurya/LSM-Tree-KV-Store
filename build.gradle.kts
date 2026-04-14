@@ -21,7 +21,7 @@ repositories {
 dependencies {
     // Logging — SLF4J facade with Logback implementation
     implementation("org.slf4j:slf4j-api:2.0.17")
-    runtimeOnly("ch.qos.logback:logback-classic:1.5.12")
+    runtimeOnly("ch.qos.logback:logback-classic:1.5.32")
 
     // Testing — JUnit 5 + AssertJ (fluent assertions) + Mockito
     testImplementation(platform("org.junit:junit-bom:5.11.3"))
