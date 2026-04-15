@@ -1,5 +1,11 @@
 # CLAUDE.md — LSM Tree KV Store
 
+## Git Identity
+
+All commits MUST use the following git identity:
+- **user.name**: `adityakrmaurya`
+- **user.email**: `adityakrmaurya03@gmail.com`
+
 ## Project Overview
 
 Production-grade LSM Tree (Log-Structured Merge Tree) Key-Value Store in Java 21.
