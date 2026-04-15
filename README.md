@@ -1,7 +1,7 @@
 # LSM Tree Key-Value Store
 
-[![CI](https://github.com/adityakrmaurya/LSM-Tree-KV-Store/actions/workflows/ci.yml/badge.svg)](https://github.com/adityakrmaurya/LSM-Tree-KV-Store/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/adityakrmaurya/LSM-Tree-KV-Store/actions/workflows/codeql.yml/badge.svg)](https://github.com/adityakrmaurya/LSM-Tree-KV-Store/actions/workflows/codeql.yml)
+[![CI](https://github.com/adityakrmaurya/lsm-tree-kv-store/actions/workflows/ci.yml/badge.svg)](https://github.com/adityakrmaurya/LSM-Tree-KV-Store/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/adityakrmaurya/lsm-tree-kv-store/actions/workflows/codeql.yml/badge.svg)](https://github.com/adityakrmaurya/LSM-Tree-KV-Store/actions/workflows/codeql.yml)
 [![Coverage](.github/badges/coverage.svg)](#code-coverage)
 [![Java 21](https://img.shields.io/badge/Java-21-blue?logo=openjdk&logoColor=white)](https://openjdk.org/projects/jdk/21/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
