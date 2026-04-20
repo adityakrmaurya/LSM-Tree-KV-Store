@@ -41,6 +41,13 @@ tasks.test {
     testLogging {
         events("passed", "skipped", "failed")
     }
+    // Forward `-Dpreflight.*` system properties to the test JVM so diagnostic
+    // tests (like WindowsFsyncSmokeTest) can be enabled and configured from the CLI.
+    System.getProperties().forEach { key, value ->
+        if (key is String && key.startsWith("preflight.")) {
+            systemProperty(key, value)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
