@@ -92,6 +92,54 @@ class WalBlockWriterTest {
             .isInstanceOf(IllegalArgumentException.class);
       }
     }
+
+    @Test
+    void write_negativeSeqNo_throwsIllegalArgumentException(@TempDir Path dir) throws IOException {
+      try (FileChannel ch = openNew(dir.resolve("a.log"))) {
+        WalBlockWriter w = new WalBlockWriter(ch);
+        assertThatThrownBy(() -> w.write("x".getBytes(), -1L))
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("non-negative");
+      }
+    }
+  }
+
+  @Nested
+  class Poisoning {
+
+    @Test
+    void write_afterIoException_subsequentCallThrowsIllegalState(@TempDir Path dir)
+        throws IOException {
+      Path file = dir.resolve("a.log");
+      // Channel that throws on every write to simulate disk failure.
+      java.nio.channels.WritableByteChannel failing =
+          new java.nio.channels.WritableByteChannel() {
+            @Override
+            public int write(java.nio.ByteBuffer src) throws IOException {
+              throw new IOException("simulated disk failure");
+            }
+
+            @Override
+            public boolean isOpen() {
+              return true;
+            }
+
+            @Override
+            public void close() {
+              // no-op
+            }
+          };
+      WalBlockWriter w = new WalBlockWriter(failing);
+      assertThatThrownBy(() -> w.write("first".getBytes(), 1L))
+          .isInstanceOf(IOException.class)
+          .hasMessageContaining("simulated disk failure");
+      assertThat(w.isPoisoned()).isTrue();
+      assertThatThrownBy(() -> w.write("second".getBytes(), 2L))
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("poisoned");
+      // Suppress unused-variable warning on file.
+      assertThat(file).isNotNull();
+    }
   }
 
   @Nested
@@ -165,6 +213,11 @@ class WalBlockWriterTest {
       // Block 0 fully filled (SMALL_BLOCK bytes). Block 1 has HEADER + 1 data byte = 8 bytes.
       assertThat(Files.size(file)).isEqualTo(SMALL_BLOCK + WalBlockWriter.HEADER_SIZE + 1);
 
+      // Verify the on-disk fragment-type sequence at the expected byte offsets.
+      byte[] raw = Files.readAllBytes(file);
+      assertThat(raw[6]).as("block 0 type byte").isEqualTo(WalRecordType.FIRST.code());
+      assertThat(raw[SMALL_BLOCK + 6]).as("block 1 type byte").isEqualTo(WalRecordType.LAST.code());
+
       List<WalRecord> records = readAllWithBlockSize(file, SMALL_BLOCK);
       assertThat(records).hasSize(1);
       assertThat(records.get(0).payload()).isEqualTo(payload);
@@ -184,9 +237,51 @@ class WalBlockWriterTest {
       long expected = 2L * SMALL_BLOCK + WalBlockWriter.HEADER_SIZE + 11;
       assertThat(Files.size(file)).isEqualTo(expected);
 
+      // Verify on-disk fragment type sequence: FIRST in block 0, MIDDLE in block 1, LAST in
+      // block 2. Without this, a writer bug emitting FIRST + LAST + LAST with correct lengths
+      // would still round-trip via the reader's reassembly.
+      byte[] raw = Files.readAllBytes(file);
+      assertThat(raw[6]).as("block 0 type").isEqualTo(WalRecordType.FIRST.code());
+      assertThat(raw[SMALL_BLOCK + 6]).as("block 1 type").isEqualTo(WalRecordType.MIDDLE.code());
+      assertThat(raw[2 * SMALL_BLOCK + 6]).as("block 2 type").isEqualTo(WalRecordType.LAST.code());
+
       List<WalRecord> records = readAllWithBlockSize(file, SMALL_BLOCK);
       assertThat(records).hasSize(1);
       assertThat(records.get(0).payload()).isEqualTo(payload);
+    }
+
+    @Test
+    void write_blockRemainingExactlyHeaderSize_padsAndStartsFresh(@TempDir Path dir)
+        throws IOException {
+      Path file = dir.resolve("a.log");
+      // Record A: payload 17 bytes (varint(0)=1, data=18, header+data=25, blockRemaining=7).
+      // Then writing record B: writer must treat blockRemaining==HEADER_SIZE as no-room and
+      // pad the 7 bytes before starting B in block 1. (Pre-fix this case would emit a
+      // zero-data fragment.)
+      byte[] payloadA = filled((byte) 'P', 17);
+      byte[] payloadB = "next".getBytes();
+
+      try (FileChannel ch = openNew(file)) {
+        WalBlockWriter w = new WalBlockWriter(ch, SMALL_BLOCK);
+        w.write(payloadA, 0L);
+        w.write(payloadB, 1L);
+      }
+
+      long expected = (long) SMALL_BLOCK + WalBlockWriter.HEADER_SIZE + 1 + payloadB.length;
+      assertThat(Files.size(file)).isEqualTo(expected);
+
+      // Bytes 25..31 should be zero pad (the 7-byte trailer).
+      byte[] raw = Files.readAllBytes(file);
+      for (int i = 25; i < SMALL_BLOCK; i++) {
+        assertThat(raw[i]).as("trailer pad byte at " + i).isEqualTo((byte) 0);
+      }
+      // Record B starts at block 1 with type FULL (single small payload).
+      assertThat(raw[SMALL_BLOCK + 6]).as("record B type").isEqualTo(WalRecordType.FULL.code());
+
+      List<WalRecord> records = readAllWithBlockSize(file, SMALL_BLOCK);
+      assertThat(records).hasSize(2);
+      assertThat(records.get(0).payload()).isEqualTo(payloadA);
+      assertThat(records.get(1).payload()).isEqualTo(payloadB);
     }
   }
 

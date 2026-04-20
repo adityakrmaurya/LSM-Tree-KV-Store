@@ -45,7 +45,7 @@ public enum WalRecordType {
    *     indicates either a corrupted record or a file produced by a future version with additional
    *     types
    */
-  public static WalRecordType fromByte(byte code) throws CorruptionException {
+  public static WalRecordType fromByte(byte code) {
     return switch (code) {
       case 1 -> FULL;
       case 2 -> FIRST;

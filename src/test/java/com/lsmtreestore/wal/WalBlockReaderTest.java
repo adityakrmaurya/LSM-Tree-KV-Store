@@ -47,6 +47,34 @@ class WalBlockReaderTest {
       assertThatThrownBy(() -> new WalBlockReader(file, 3))
           .isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void constructor_blockSizeAboveMaxBlockSize_throwsIllegalArgumentException(@TempDir Path dir)
+        throws IOException {
+      Path file = dir.resolve("a.log");
+      Files.createFile(file);
+      assertThatThrownBy(() -> new WalBlockReader(file, WalBlockWriter.MAX_BLOCK_SIZE + 1))
+          .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void constructor_maxRecordBytesZero_throwsIllegalArgumentException(@TempDir Path dir)
+        throws IOException {
+      Path file = dir.resolve("a.log");
+      Files.createFile(file);
+      assertThatThrownBy(() -> new WalBlockReader(file, WalBlockWriter.DEFAULT_BLOCK_SIZE, 0))
+          .isInstanceOf(IllegalArgumentException.class)
+          .hasMessageContaining("maxRecordBytes");
+    }
+
+    @Test
+    void constructor_maxRecordBytesNegative_throwsIllegalArgumentException(@TempDir Path dir)
+        throws IOException {
+      Path file = dir.resolve("a.log");
+      Files.createFile(file);
+      assertThatThrownBy(() -> new WalBlockReader(file, WalBlockWriter.DEFAULT_BLOCK_SIZE, -1))
+          .isInstanceOf(IllegalArgumentException.class);
+    }
   }
 
   @Nested
@@ -190,7 +218,124 @@ class WalBlockReaderTest {
       try (WalBlockReader r = new WalBlockReader(file)) {
         assertThatThrownBy(r::readNext)
             .isInstanceOf(CorruptionException.class)
-            .hasMessageContaining("exceeds max payload");
+            .hasMessageContaining("exceeds remaining bytes in block");
+      }
+    }
+
+    @Test
+    void readNext_lengthCrossesBlockBoundary_throwsCorruptionException(@TempDir Path dir)
+        throws IOException {
+      // Adversarial file: a record header placed mid-block whose length would extend across
+      // the block boundary into the next block. Pre-fix the reader would silently desynchronize.
+      // Use 32-byte blocks. Place a header at offset 16 that claims length 20 (16+7+20 = 43,
+      // crossing into block 1 which starts at 32).
+      int blockSize = 32;
+      byte[] file = new byte[blockSize * 2];
+      // First 16 bytes: a benign FULL record. Header at offset 0, data of length 9
+      // (varint(0)=1 + payload 8). Total = 7 + 9 = 16 bytes.
+      byte[] firstData = new byte[9];
+      firstData[0] = 0; // varint(0)
+      // Build first record's frame.
+      byte[] first = buildFrame(WalRecordType.FULL, firstData);
+      System.arraycopy(first, 0, file, 0, first.length);
+      // Now craft the malicious second header at offset 16, claiming length 20 (would extend
+      // to offset 16 + 7 + 20 = 43, crossing block 1 boundary at offset 32). CRC is bogus
+      // because the cross-block check fires first.
+      byte[] data = new byte[20];
+      java.util.Arrays.fill(data, (byte) 'X');
+      byte[] second = buildFrame(WalRecordType.FULL, data);
+      // Only copy the header — actual data bytes don't matter, the length check fires first.
+      System.arraycopy(second, 0, file, 16, WalBlockWriter.HEADER_SIZE);
+
+      Path path = dir.resolve("attack.log");
+      Files.write(path, file);
+
+      try (WalBlockReader r = new WalBlockReader(path, blockSize)) {
+        // First record reads cleanly.
+        assertThat(r.readNext()).isPresent();
+        // Second one trips the cross-block guard.
+        assertThatThrownBy(r::readNext)
+            .isInstanceOf(CorruptionException.class)
+            .hasMessageContaining("exceeds remaining bytes in block");
+      }
+    }
+
+    @Test
+    void readNext_emptyPayloadAfterSeqNoStrip_throwsCorruptionException(@TempDir Path dir)
+        throws IOException {
+      // Hand-craft a FULL record whose data section is just a single varint byte (seqNo=42)
+      // with no payload after it. The writer never emits this; the reader must reject it.
+      byte[] data = new byte[1];
+      data[0] = 42;
+      Path file = dir.resolve("a.log");
+      Files.write(file, buildFrame(WalRecordType.FULL, data));
+
+      try (WalBlockReader r = new WalBlockReader(file)) {
+        assertThatThrownBy(r::readNext)
+            .isInstanceOf(CorruptionException.class)
+            .hasMessageContaining("no payload after stripping seqNo varint");
+      }
+    }
+
+    @Test
+    void readNext_malformedSeqNoVarint_throwsCorruptionException(@TempDir Path dir)
+        throws IOException {
+      // 10 bytes all 0xFF: every continuation bit set, no terminator, varint64 parser will
+      // exhaust its 64-bit shift budget and throw IAE which the reader wraps in
+      // CorruptionException.
+      byte[] data = new byte[10];
+      java.util.Arrays.fill(data, (byte) 0xFF);
+      Path file = dir.resolve("a.log");
+      Files.write(file, buildFrame(WalRecordType.FULL, data));
+
+      try (WalBlockReader r = new WalBlockReader(file)) {
+        assertThatThrownBy(r::readNext)
+            .isInstanceOf(CorruptionException.class)
+            .hasMessageContaining("Malformed seqNo varint");
+      }
+    }
+
+    @Test
+    void readNext_firstFollowedByFirst_throwsCorruptionException(@TempDir Path dir)
+        throws IOException {
+      // Hand-craft FIRST followed by another FIRST. Reader's switch only accepts MIDDLE/LAST
+      // inside the multi-fragment loop; FIRST hits the default arm.
+      byte[] dataA = new byte[5];
+      dataA[0] = 1; // varint(1)
+      byte[] dataB = new byte[5];
+      dataB[0] = 2; // varint(2)
+      byte[] frameA = buildFrame(WalRecordType.FIRST, dataA);
+      byte[] frameB = buildFrame(WalRecordType.FIRST, dataB);
+      byte[] combined = new byte[frameA.length + frameB.length];
+      System.arraycopy(frameA, 0, combined, 0, frameA.length);
+      System.arraycopy(frameB, 0, combined, frameA.length, frameB.length);
+      Path file = dir.resolve("a.log");
+      Files.write(file, combined);
+
+      try (WalBlockReader r = new WalBlockReader(file)) {
+        assertThatThrownBy(r::readNext)
+            .isInstanceOf(CorruptionException.class)
+            .hasMessageContaining("Unexpected fragment type inside multi-fragment record");
+      }
+    }
+
+    @Test
+    void readNext_reassembledRecordExceedsMaxRecordBytes_throwsCorruptionException(
+        @TempDir Path dir) throws IOException {
+      // Write a real multi-fragment record then read with a max-record cap below its size.
+      Path file = dir.resolve("big.log");
+      byte[] payload = new byte[100000]; // > 3 default-size blocks
+      java.util.Arrays.fill(payload, (byte) 'M');
+      try (FileChannel ch =
+          FileChannel.open(file, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+        WalBlockWriter w = new WalBlockWriter(ch);
+        w.write(payload, 1L);
+      }
+
+      try (WalBlockReader r = new WalBlockReader(file, WalBlockWriter.DEFAULT_BLOCK_SIZE, 1024)) {
+        assertThatThrownBy(r::readNext)
+            .isInstanceOf(CorruptionException.class)
+            .hasMessageContaining("would exceed maxRecordBytes");
       }
     }
   }

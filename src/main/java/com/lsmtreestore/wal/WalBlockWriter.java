@@ -14,16 +14,16 @@ import java.util.Objects;
  * 32 KB), and each block contains one or more 7-byte-header-prefixed records. Records larger than a
  * single block are split across {@link WalRecordType#FIRST}, zero or more {@link
  * WalRecordType#MIDDLE} fragments, and a {@link WalRecordType#LAST} record. If fewer than 7 bytes
- * remain at the end of a block (not enough for a header), those bytes are zero-padded and the next
- * record starts at the beginning of the next block.
+ * remain at the end of a block (or exactly 7, since a header alone wastes the block), those bytes
+ * are zero-padded and the next record starts at the beginning of the next block.
  *
  * <p>Each record's header is:
  *
  * <pre>
- *   [CRC32C masked: 4 bytes, little-endian]
- *   [Length:        2 bytes, little-endian]
- *   [Type:          1 byte: FULL=1, FIRST=2, MIDDLE=3, LAST=4]
- *   [Data:          Length bytes]
+ *   [CRC32C masked: 4 bytes, little-endian] (offset 0)
+ *   [Length:        2 bytes, little-endian] (offset 4)
+ *   [Type:          1 byte: FULL=1, FIRST=2, MIDDLE=3, LAST=4] (offset 6)
+ *   [Data:          Length bytes]                              (offset 7)
  * </pre>
  *
  * <p>The CRC covers the Type byte plus the Data bytes, then is masked via {@link
@@ -38,6 +38,13 @@ import java.util.Objects;
  * <p><strong>Thread safety:</strong> this class is <strong>not</strong> thread-safe. A single WAL
  * file has exactly one {@code WalBlockWriter} instance, and the coordinator (forthcoming) is
  * responsible for serializing access to it.
+ *
+ * <p><strong>Failure semantics:</strong> any {@link IOException} thrown from {@link #write(byte[],
+ * long)} marks the writer as poisoned. After poisoning, every subsequent {@code write()} call fails
+ * fast with {@link IllegalStateException} — the channel cursor and the writer's block-position
+ * counter may have diverged on a partial-write IOException, so continuing would silently corrupt
+ * subsequent block boundaries. The owner (typically the WAL coordinator) is responsible for
+ * discarding a poisoned writer and any in-progress batch.
  */
 public final class WalBlockWriter {
 
@@ -50,11 +57,23 @@ public final class WalBlockWriter {
   /** Maximum Length value the 2-byte length field can encode (0–65535). */
   public static final int MAX_RECORD_LENGTH = 0xFFFF;
 
+  /** Maximum legal block size: header + max length field. */
+  public static final int MAX_BLOCK_SIZE = HEADER_SIZE + MAX_RECORD_LENGTH;
+
+  // Header field byte offsets within a record frame. Shared with WalBlockReader.
+  static final int CRC_OFFSET = 0;
+  static final int LENGTH_OFFSET = 4;
+  static final int TYPE_OFFSET = 6;
+  static final int DATA_OFFSET = HEADER_SIZE;
+
   private final WritableByteChannel channel;
   private final int blockSize;
 
   // Bytes already written into the current block. Resets to 0 at block boundaries.
   private int bytesInCurrentBlock;
+
+  // Set to true after any IOException from writeFully; subsequent writes fail fast.
+  private boolean poisoned;
 
   /**
    * Constructs a writer over the given channel using the default 32 KB block size.
@@ -70,9 +89,8 @@ public final class WalBlockWriter {
    * Constructs a writer over the given channel with a custom block size.
    *
    * @param channel the channel to write framed bytes into; must be open for writing
-   * @param blockSize the block size in bytes; must be &gt; {@link #HEADER_SIZE} and fit the 2-byte
-   *     Length field, so in practice {@code HEADER_SIZE &lt; blockSize &le; MAX_RECORD_LENGTH +
-   *     HEADER_SIZE}
+   * @param blockSize the block size in bytes; must satisfy {@code HEADER_SIZE < blockSize <=
+   *     MAX_BLOCK_SIZE} (i.e. the data portion of a single block must fit the 2-byte Length field)
    * @throws NullPointerException if {@code channel} is {@code null}
    * @throws IllegalArgumentException if {@code blockSize} is out of range
    */
@@ -82,15 +100,13 @@ public final class WalBlockWriter {
       throw new IllegalArgumentException(
           "blockSize must be > HEADER_SIZE (" + HEADER_SIZE + "), got " + blockSize);
     }
-    if (blockSize - HEADER_SIZE > MAX_RECORD_LENGTH) {
+    if (blockSize > MAX_BLOCK_SIZE) {
       throw new IllegalArgumentException(
-          "blockSize - HEADER_SIZE must fit the 2-byte Length field (<= "
-              + MAX_RECORD_LENGTH
-              + "), got "
-              + blockSize);
+          "blockSize must be <= MAX_BLOCK_SIZE (" + MAX_BLOCK_SIZE + "), got " + blockSize);
     }
     this.blockSize = blockSize;
     this.bytesInCurrentBlock = 0;
+    this.poisoned = false;
   }
 
   /**
@@ -103,30 +119,56 @@ public final class WalBlockWriter {
   }
 
   /**
+   * Returns whether this writer has been marked unusable due to a prior {@link IOException}.
+   *
+   * @return true if any prior {@code write()} threw {@link IOException}
+   */
+  public boolean isPoisoned() {
+    return poisoned;
+  }
+
+  /**
    * Appends one logical WAL record to the channel, splitting across blocks as needed.
    *
    * <p>The on-wire Data for this record is {@code varint(seqNo) || payload}. If the combined size
    * exceeds what fits in the remaining space of the current block, the record is split into FIRST /
-   * MIDDLE* / LAST fragments. If the current block has fewer than {@link #HEADER_SIZE} bytes
-   * remaining, those bytes are zero-padded before writing the next record.
+   * MIDDLE* / LAST fragments. If the current block has 7 or fewer bytes remaining (not enough for a
+   * header + at least one data byte), those bytes are zero-padded before writing the next record.
    *
    * @param payload the caller's opaque payload bytes; must not be {@code null} and must be
    *     non-empty
    * @param seqNo the sequence number to persist alongside the payload (varint-encoded as a prefix
-   *     of the on-wire Data); any non-negative value is valid, values are encoded unsigned-varint
+   *     of the on-wire Data); must be non-negative
    * @throws NullPointerException if {@code payload} is {@code null}
-   * @throws IllegalArgumentException if {@code payload} is empty
-   * @throws IOException if the underlying channel write fails
+   * @throws IllegalArgumentException if {@code payload} is empty, {@code seqNo} is negative, or the
+   *     composed data length would overflow {@code int}
+   * @throws IllegalStateException if this writer was previously poisoned by an {@link IOException}
+   * @throws IOException if the underlying channel write fails (also poisons the writer)
    */
   public void write(byte[] payload, long seqNo) throws IOException {
+    if (poisoned) {
+      throw new IllegalStateException("writer is poisoned (prior IOException)");
+    }
     Objects.requireNonNull(payload, "payload");
     if (payload.length == 0) {
       throw new IllegalArgumentException("payload must be non-empty");
     }
+    if (seqNo < 0) {
+      throw new IllegalArgumentException("seqNo must be non-negative, got " + seqNo);
+    }
 
-    // Compose the on-wire data: varint(seqNo) || payload. One allocation.
+    // Compose the on-wire data: varint(seqNo) || payload. Use long math to detect overflow before
+    // the new byte[] allocation would silently flip negative.
     int seqNoSize = Coding.varintSize(seqNo);
-    byte[] data = new byte[seqNoSize + payload.length];
+    long composedLength = (long) seqNoSize + (long) payload.length;
+    if (composedLength > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException(
+          "composed record data length overflows int: seqNoSize="
+              + seqNoSize
+              + ", payloadLength="
+              + payload.length);
+    }
+    byte[] data = new byte[(int) composedLength];
     Coding.encodeVarint64(data, 0, seqNo);
     System.arraycopy(payload, 0, data, seqNoSize, payload.length);
 
@@ -136,7 +178,10 @@ public final class WalBlockWriter {
 
     while (remaining > 0) {
       int blockRemaining = blockSize - bytesInCurrentBlock;
-      if (blockRemaining < HEADER_SIZE) {
+      // Strictly less than HEADER_SIZE + 1 bytes left = no room for a header AND a data byte.
+      // Equality (blockRemaining == HEADER_SIZE) would emit a zero-data fragment that wastes
+      // space and creates a fragment the reader has to handle for no value — pad instead.
+      if (blockRemaining <= HEADER_SIZE) {
         padBlockTrailer(blockRemaining);
         blockRemaining = blockSize;
       }
@@ -176,16 +221,13 @@ public final class WalBlockWriter {
     int totalSize = HEADER_SIZE + dataLength;
     byte[] frame = new byte[totalSize];
 
-    // Length (bytes 4..5, little-endian).
-    Coding.encodeFixed16(frame, 4, dataLength);
-    // Type (byte 6).
-    frame[6] = type.code();
-    // Data (bytes 7..7+dataLength).
-    System.arraycopy(data, dataOffset, frame, HEADER_SIZE, dataLength);
+    Coding.encodeFixed16(frame, LENGTH_OFFSET, dataLength);
+    frame[TYPE_OFFSET] = type.code();
+    System.arraycopy(data, dataOffset, frame, DATA_OFFSET, dataLength);
 
-    // CRC32C over type + data, masked, written into bytes 0..3.
-    int crc = Checksum.compute(frame, 6, 1 + dataLength);
-    Coding.encodeFixed32(frame, 0, Checksum.mask(crc));
+    // CRC32C over [type | data], masked, written into the CRC slot.
+    int crc = Checksum.compute(frame, TYPE_OFFSET, 1 + dataLength);
+    Coding.encodeFixed32(frame, CRC_OFFSET, Checksum.mask(crc));
 
     writeFully(ByteBuffer.wrap(frame));
     bytesInCurrentBlock += totalSize;
@@ -195,8 +237,8 @@ public final class WalBlockWriter {
   }
 
   /**
-   * Zero-pads the remainder of the current block (when fewer than {@link #HEADER_SIZE} bytes are
-   * left) and resets the block position.
+   * Zero-pads the remainder of the current block (when the room left can't fit a header + at least
+   * one data byte) and resets the block position.
    *
    * @param padBytes number of zero bytes to write to fill out the block
    */
@@ -211,15 +253,19 @@ public final class WalBlockWriter {
   }
 
   /**
-   * Writes the entire buffer to the channel, looping until position == limit.
-   *
-   * <p>{@link WritableByteChannel#write(ByteBuffer)} is permitted to do a short write. Concrete
-   * subclasses like {@code FileChannel} on local disk rarely short-write, but other channel
-   * implementations (sockets, test doubles) may.
+   * Writes the entire buffer to the channel, looping until position == limit. On any {@link
+   * IOException}, marks the writer as poisoned and rethrows; the channel cursor and the writer's
+   * block-position counter may have diverged after a partial write, so subsequent writes would
+   * corrupt block boundaries.
    */
   private void writeFully(ByteBuffer buf) throws IOException {
-    while (buf.hasRemaining()) {
-      channel.write(buf);
+    try {
+      while (buf.hasRemaining()) {
+        channel.write(buf);
+      }
+    } catch (IOException ioe) {
+      poisoned = true;
+      throw ioe;
     }
   }
 }
