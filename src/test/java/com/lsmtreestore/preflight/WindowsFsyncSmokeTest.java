@@ -26,10 +26,23 @@ import org.slf4j.LoggerFactory;
 /**
  * Pre-flight diagnostic for the WAL module's group-commit coordinator.
  *
- * <p>Verifies that {@link FileChannel#force(boolean)} behaves correctly on the current platform
- * under concurrent load from many virtual threads calling it frequently. This is step 0 of the PR
- * #1 build order: before investing a weekend on a coordinator whose marquee test assumes {@code
- * force(false)} works, prove the OS can actually do it.
+ * <p>Models the coordinator's expected access pattern: a single {@link FileChannel} owned by one
+ * WAL writer, with many producer threads contending for one serialization lock and whichever thread
+ * holds the lock performs the {@link FileChannel#write(java.nio.ByteBuffer)} + {@link
+ * FileChannel#force(boolean) force(false)}. This is step 0 of the PR #1 build order: before
+ * investing a weekend on a coordinator whose marquee test depends on {@code force(false)} behaving
+ * correctly under this pattern, prove the OS can actually handle it.
+ *
+ * <p><strong>What this test measures:</strong> high contention on a single writer slot. 100 virtual
+ * threads repeatedly race for the lock; the winner writes 10 KB and {@code force}s durably. {@code
+ * force(false)} is therefore called frequently but never concurrently on the same channel. This
+ * matches the WAL's single-writer-per-file discipline and the leader-follower group commit design
+ * (one "leader" does the I/O for everyone).
+ *
+ * <p><strong>What this test does NOT measure:</strong> concurrent {@code force(false)} calls from
+ * multiple threads on the same channel. That access pattern is not used by the WAL coordinator. If
+ * the coordinator design ever changes to allow concurrent {@code force} calls, this preflight would
+ * need a second variant.
  *
  * <p>Disabled by default. To run:
  *
@@ -38,15 +51,13 @@ import org.slf4j.LoggerFactory;
  *                  -Dpreflight.run=true [-Dpreflight.durationSec=60]
  * </pre>
  *
- * <p>Spawns 100 virtual threads that each repeatedly (i) acquire a shared lock, (ii) append a 10 KB
- * payload to a single {@link FileChannel}, (iii) call {@code force(false)}, (iv) release the lock.
- * Runs for a configurable duration (default 60 seconds). At the end asserts that no thread threw,
- * the file size on disk matches the sum of reported writes, and no torn write is visible at the
- * length level.
+ * <p>Runs for a configurable duration (default 60 seconds). At the end asserts that no thread
+ * threw, the file size on disk matches the sum of reported writes, and no torn write is visible at
+ * the length level.
  *
- * <p>Pass criteria &rarr; Windows handles the coordinator's access pattern; the marquee test can
- * run on Windows CI. Fail criteria &rarr; either gate the marquee test to Linux only, or switch the
- * I/O strategy to {@code RandomAccessFile} + {@code FileDescriptor.sync()}.
+ * <p>Pass criteria &rarr; platform handles the coordinator's access pattern; the marquee test can
+ * run on that platform's CI. Fail criteria &rarr; either gate the marquee test to a known-good
+ * platform, or switch the I/O strategy to {@code RandomAccessFile} + {@code FileDescriptor.sync()}.
  *
  * <p>This test is intentionally a diagnostic (not a unit test); it writes hundreds of MB to
  * {@code @TempDir} and runs for a full minute by default. The {@code @TempDir} infrastructure
@@ -77,6 +88,10 @@ class WindowsFsyncSmokeTest {
     long durationSec = Long.getLong("preflight.durationSec", DEFAULT_DURATION_SEC);
     Path file = dir.resolve("preflight.log");
 
+    // The payload array is shared across all worker threads. This is safe because it is filled
+    // once above and never mutated afterwards; each worker wraps it in its own ByteBuffer (so
+    // position/limit are thread-local) and reads only. Cloning per thread would cost 1 MB for no
+    // behavioral benefit.
     byte[] payloadBytes = new byte[PAYLOAD_SIZE];
     Arrays.fill(payloadBytes, (byte) 0x5A);
 
@@ -134,11 +149,14 @@ class WindowsFsyncSmokeTest {
       for (Thread t : threads) {
         long remainingMs = joinDeadlineMs - System.currentTimeMillis();
         if (remainingMs <= 0) {
-          fail("Timed out waiting for worker threads to finish — probable deadlock");
+          fail(
+              "Timed out waiting for worker threads to finish — probable deadlock\n"
+                  + dump(threads));
         }
         t.join(remainingMs);
         if (t.isAlive()) {
-          fail("Worker thread " + t.getName() + " still alive after join timeout");
+          fail(
+              "Worker thread " + t.getName() + " still alive after join timeout\n" + dump(threads));
         }
       }
 
@@ -166,5 +184,25 @@ class WindowsFsyncSmokeTest {
     long reopenedSize = Files.size(file);
     LOG.info("preflight reopened size after channel close: {}", reopenedSize);
     assertThat(reopenedSize).as("file size stable after close").isPositive();
+  }
+
+  /**
+   * Captures a thread-stack snapshot of any worker still alive. Used when the join loop fails so
+   * that "probable deadlock" messages are actionable instead of opaque.
+   *
+   * @param threads the worker threads to inspect
+   * @return a multi-line string listing each alive thread's name followed by its stack trace
+   */
+  private static String dump(List<Thread> threads) {
+    StringBuilder sb = new StringBuilder();
+    for (Thread t : threads) {
+      if (t.isAlive()) {
+        sb.append(t.getName()).append(":\n");
+        for (StackTraceElement frame : t.getStackTrace()) {
+          sb.append("  ").append(frame).append('\n');
+        }
+      }
+    }
+    return sb.isEmpty() ? "(no alive threads captured)" : sb.toString();
   }
 }
