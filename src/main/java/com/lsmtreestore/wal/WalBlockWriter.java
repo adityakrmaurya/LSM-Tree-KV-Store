@@ -73,7 +73,10 @@ public final class WalBlockWriter {
   private int bytesInCurrentBlock;
 
   // Set to true after any IOException from writeFully; subsequent writes fail fast.
-  private boolean poisoned;
+  // volatile so that a coordinator handing the writer across threads via any synchronizer
+  // still sees the correct poisoned state — even if the transfer primitive itself doesn't
+  // establish a happens-before edge for this particular field.
+  private volatile boolean poisoned;
 
   /**
    * Constructs a writer over the given channel using the default 32 KB block size.
@@ -261,7 +264,17 @@ public final class WalBlockWriter {
   private void writeFully(ByteBuffer buf) throws IOException {
     try {
       while (buf.hasRemaining()) {
-        channel.write(buf);
+        int written = channel.write(buf);
+        if (written == 0) {
+          // FileChannel over regular files won't return 0 with a non-empty buffer, but
+          // other WritableByteChannel implementations (non-blocking sockets, flow-controlled
+          // pipes, or test doubles) can. Treat as I/O failure rather than spinning.
+          throw new IOException(
+              "Channel returned 0 bytes with "
+                  + buf.remaining()
+                  + " remaining; aborting to"
+                  + " avoid a livelock");
+        }
       }
     } catch (IOException ioe) {
       poisoned = true;

@@ -55,7 +55,8 @@ public final class WalBlockReader implements AutoCloseable {
   private final int maxRecordBytes;
 
   // Bytes already consumed from the current block. Resets to 0 at block boundaries.
-  private long position;
+  // volatile for symmetry with the writer's poisoned field — see WalBlockWriter.poisoned.
+  private volatile long position;
 
   /**
    * Opens a WAL file for sequential reading using the default 32 KB block size and the default
@@ -119,11 +120,25 @@ public final class WalBlockReader implements AutoCloseable {
     if (maxRecordBytes <= 0) {
       throw new IllegalArgumentException("maxRecordBytes must be positive, got " + maxRecordBytes);
     }
-    this.channel = FileChannel.open(file, StandardOpenOption.READ);
-    this.blockSize = blockSize;
-    this.fileSize = Files.size(file);
-    this.maxRecordBytes = maxRecordBytes;
-    this.position = 0;
+    // Open the channel and initialize remaining fields in one try/catch so any IOException
+    // from Files.size (or elsewhere) closes the channel before propagating. Java does not
+    // invoke AutoCloseable.close on partially-constructed objects, so without this the file
+    // descriptor would be orphaned until GC (bad on Windows where it also holds a file lock).
+    FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
+    try {
+      this.channel = ch;
+      this.blockSize = blockSize;
+      this.fileSize = Files.size(file);
+      this.maxRecordBytes = maxRecordBytes;
+      this.position = 0;
+    } catch (IOException | RuntimeException e) {
+      try {
+        ch.close();
+      } catch (IOException suppressed) {
+        e.addSuppressed(suppressed);
+      }
+      throw e;
+    }
   }
 
   /**
@@ -153,6 +168,19 @@ public final class WalBlockReader implements AutoCloseable {
           position);
     }
     long recordStartOffset = position - first.data.length - WalBlockWriter.HEADER_SIZE;
+    // Check the FIRST fragment against the cap before accumulating. Without this, a single
+    // FIRST fragment up to MAX_RECORD_LENGTH (65535) bytes silently bypasses the cap because
+    // the loop-time check only runs from the second fragment onward.
+    if (first.data.length > maxRecordBytes) {
+      throw new CorruptionException(
+          "FIRST fragment size "
+              + first.data.length
+              + " exceeds maxRecordBytes ("
+              + maxRecordBytes
+              + ")",
+          file,
+          recordStartOffset);
+    }
     ByteArrayOutputStream acc = new ByteArrayOutputStream();
     acc.write(first.data, 0, first.data.length);
     while (true) {
@@ -161,7 +189,9 @@ public final class WalBlockReader implements AutoCloseable {
         throw new CorruptionException(
             "Truncated multi-fragment record: missing LAST after FIRST/MIDDLE", file, position);
       }
-      if (acc.size() + next.data.length > maxRecordBytes) {
+      // Long math to avoid int-overflow under pathological maxRecordBytes near
+      // Integer.MAX_VALUE (legal per constructor validation).
+      if ((long) acc.size() + (long) next.data.length > maxRecordBytes) {
         throw new CorruptionException(
             "Reassembled record would exceed maxRecordBytes (" + maxRecordBytes + ")",
             file,
@@ -230,8 +260,18 @@ public final class WalBlockReader implements AutoCloseable {
     int maskedCrc = Coding.decodeFixed32(header, WalBlockWriter.CRC_OFFSET);
     int length = Coding.decodeFixed16(header, WalBlockWriter.LENGTH_OFFSET);
     byte typeCode = header[WalBlockWriter.TYPE_OFFSET];
-    WalRecordType type = WalRecordType.fromByte(typeCode);
 
+    // The writer never emits a length=0 fragment (composed data is at least the varint for
+    // seqNo, which is >= 1 byte). A hostile or corrupt file can though. Rejecting here gives a
+    // clearer error than letting decodeLogical fail downstream with "Malformed seqNo varint".
+    if (length == 0) {
+      throw new CorruptionException(
+          "Record length is zero; writer never emits empty records",
+          file,
+          position - WalBlockWriter.HEADER_SIZE);
+    }
+
+    WalRecordType type = WalRecordType.fromByte(typeCode);
     // Cross-block validation: the writer never emits a fragment whose data crosses a block
     // boundary. A malicious or corrupt file that claims a length larger than what fits in the
     // current block would otherwise desynchronize all subsequent records.

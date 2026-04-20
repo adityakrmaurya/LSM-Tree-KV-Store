@@ -140,6 +140,34 @@ class WalBlockWriterTest {
       // Suppress unused-variable warning on file.
       assertThat(file).isNotNull();
     }
+
+    @Test
+    void write_channelReturnsZeroBytes_throwsIoExceptionAndPoisons() {
+      // A channel that always returns 0 (simulating a stuck non-blocking channel or a
+      // broken test double). Without the zero-byte sentinel, the writer would spin forever.
+      java.nio.channels.WritableByteChannel zeroReturning =
+          new java.nio.channels.WritableByteChannel() {
+            @Override
+            public int write(java.nio.ByteBuffer src) {
+              return 0;
+            }
+
+            @Override
+            public boolean isOpen() {
+              return true;
+            }
+
+            @Override
+            public void close() {
+              // no-op
+            }
+          };
+      WalBlockWriter w = new WalBlockWriter(zeroReturning);
+      assertThatThrownBy(() -> w.write("x".getBytes(), 0L))
+          .isInstanceOf(IOException.class)
+          .hasMessageContaining("returned 0 bytes");
+      assertThat(w.isPoisoned()).isTrue();
+    }
   }
 
   @Nested

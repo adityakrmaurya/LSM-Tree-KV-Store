@@ -333,9 +333,62 @@ class WalBlockReaderTest {
       }
 
       try (WalBlockReader r = new WalBlockReader(file, WalBlockWriter.DEFAULT_BLOCK_SIZE, 1024)) {
+        // The FIRST fragment is ~32 KB (blockSize - HEADER_SIZE), larger than the 1024-byte
+        // cap. Pre-fix the cap only fired inside the loop, letting FIRST silently bypass it.
+        // Post-fix, either the FIRST-specific error or the loop error fires — both are OK.
         assertThatThrownBy(r::readNext)
             .isInstanceOf(CorruptionException.class)
-            .hasMessageContaining("would exceed maxRecordBytes");
+            .hasMessageMatching("(?s).*maxRecordBytes.*");
+      }
+    }
+
+    @Test
+    void readNext_firstFragmentAloneExceedsMaxRecordBytes_throws(@TempDir Path dir)
+        throws IOException {
+      // Surgical: a single FIRST fragment whose data exceeds maxRecordBytes, verifying the
+      // FIRST-specific cap check (not just the loop check). Build a FIRST frame with 20 data
+      // bytes, then a LAST frame to satisfy the state machine. Set maxRecordBytes=10 so FIRST
+      // trips immediately before the loop runs.
+      byte[] firstData = new byte[20];
+      firstData[0] = 0; // varint(0)
+      for (int i = 1; i < 20; i++) {
+        firstData[i] = (byte) i;
+      }
+      byte[] frameFirst = buildFrame(WalRecordType.FIRST, firstData);
+      byte[] lastData = new byte[] {(byte) 'x'};
+      byte[] frameLast = buildFrame(WalRecordType.LAST, lastData);
+      byte[] combined = new byte[frameFirst.length + frameLast.length];
+      System.arraycopy(frameFirst, 0, combined, 0, frameFirst.length);
+      System.arraycopy(frameLast, 0, combined, frameFirst.length, frameLast.length);
+      Path file = dir.resolve("first-over.log");
+      Files.write(file, combined);
+
+      try (WalBlockReader r = new WalBlockReader(file, WalBlockWriter.DEFAULT_BLOCK_SIZE, 10)) {
+        assertThatThrownBy(r::readNext)
+            .isInstanceOf(CorruptionException.class)
+            .hasMessageContaining("FIRST fragment")
+            .hasMessageContaining("exceeds maxRecordBytes");
+      }
+    }
+
+    @Test
+    void readNext_lengthZero_throwsCorruptionException(@TempDir Path dir) throws IOException {
+      // Hand-craft a FULL header with length=0. Writer never emits this; reader rejects it
+      // with a clear error before reaching decodeLogical (parser-differential fix).
+      byte[] frame = new byte[WalBlockWriter.HEADER_SIZE];
+      byte[] typeOnly = new byte[] {WalRecordType.FULL.code()};
+      int crc = Checksum.compute(typeOnly);
+      Coding.encodeFixed32(frame, 0, Checksum.mask(crc));
+      Coding.encodeFixed16(frame, 4, 0);
+      frame[6] = WalRecordType.FULL.code();
+
+      Path file = dir.resolve("zero.log");
+      Files.write(file, frame);
+
+      try (WalBlockReader r = new WalBlockReader(file)) {
+        assertThatThrownBy(r::readNext)
+            .isInstanceOf(CorruptionException.class)
+            .hasMessageContaining("length is zero");
       }
     }
   }
